@@ -1,0 +1,185 @@
+from playwright.sync_api import sync_playwright, \
+    expect  # Import playwright. Note: You may have to install it first using "pip install pytest-playwright"
+
+# define JavaScript parser
+parse_script = """
+() => {
+function isOccluded(el) {
+	if(el.nodeType === Node.ELEMENT_NODE && el.ownerDocument === document){//Check if it's even an element node, since content inside nested documents has a different coordinate system they are ignored
+		const rect = el.getBoundingClientRect();//get the rectangle the node occupies
+		let elementArea = rect.width*rect.height//calculate its area...
+		const centerX = rect.left + rect.width / 2;//...and center coordinate
+		const centerY = rect.top + rect.height / 2;
+		const topElement = document.elementFromPoint(centerX, centerY);//get the top element at the center coordinate
+		if(topElement&& topElement.nodeName!="A"){//a tags (links) should not occlude other elements as they are sometimes overlayed to make elements clickable
+			if(!el.contains(topElement) && !topElement.contains(el)){//if they are not a child of each other...
+				//calculate intersection box:
+				let topRect = topElement.getBoundingClientRect();//get the rectangle the top element occupies
+				let left = Math.max(rect.left, topRect.left)
+				let right = Math.min(rect.right, topRect.right)
+				let top = Math.max(rect.top, topRect.top)
+				let bottom = Math.min(rect.bottom, topRect.bottom)
+
+				/*
+				 * 
+				 * 
+				 * 
+				 * We calculate the edges of the box of intersection (so we can then calculate width and height and ultimately the area):
+				 * 
+				 *         |--width-|
+				 * 
+				 *   +--------------+
+				 *   |              |
+				 *   |     +--top---+--------+   –
+				 *   |     |########|        |   |
+				 *   |     |########|        |   |
+				 *   | left|########|right   |   | height
+				 *   |     |########|        |   |
+				 *   |     |########|        |   |
+				 *   +-----+-bottom-+        |   –
+				 *         |                 |
+				 *         +-----------------+
+				 * 
+				 * height = bottom - top
+				 * width = right-left
+				 * 
+				 */
+				if(right<left || bottom<top) return false//check if the intersection box is invalid, return false if it is
+				let intersectArea = (right-left)*(bottom-top)//get the area of the intersection
+				return intersectArea/elementArea>0.5//treat element as occluded when over 50% of its are is occluded
+			}
+		}
+
+	}
+	return false;
+}
+
+function isClickable(node) {//use a css query to match common objects that can be clicked (there may be unchecked edge cases)
+	if(node.nodeType === Node.ELEMENT_NODE){
+		return node.matches('a, button, select, option, area, input[type="submit"], input[type="button"], input[type="reset"], input[type="radio"], input[type="checkbox"], [role="button"], [role="link"], [role="checkbox"], [role="menuitemcheckbox"] , [role="menuitemradio"], [role="option"], [role="radio"], [role="switch"], [role="tab"], [role="treeitem"], [onclick]')
+	}else{
+		return false
+	}
+}
+
+function isTypeable(node) {//use a css query to match common objects one can type in (there may be unchecked edge cases)
+	if(node.nodeType === Node.ELEMENT_NODE){
+		return node.matches('input[type="text"],input[type="password"],input[type="email"],input[type="search"],input[type="tel"],input[type="url"],input[type="number"],textarea,[role="textbox"], [role="search"], [role="searchbox"], [role="combobox"], [onkeydown],[onkeypress],[onkeyup]')
+	}else{
+		return false
+	}
+}
+
+
+function annotateNode(element) {//recursive main loop: Creates a copy of the DOM, incorporates shadow DOM, removes invisible/occluded elements, annotates usability of elements and replaces all other tags with 
+	if(!element){//If the lement is None/undefined it is replaced with an empty TextNode
+		return document.createTextNode("")
+	}else if(element.nodeType== Node.TEXT_NODE){//Text nodes are copied as is:
+			return document.createTextNode(element.textContent)
+	}else if(element.nodeType === Node.ELEMENT_NODE){//Remove elements that are invisible, occluded or simply invisible by default (e.g. scripts):
+		if(["SCRIPT", "STYLE","META","LINK","NOSCRIPT"].includes(element.nodeName) || isOccluded(element) || !element.checkVisibility({opacityProperty: true, visibilityProperty : true})) {
+			return document.createElement("br")
+		}
+	}
+
+	let name =  isClickable(element) ? "clickable": isTypeable(element) ? "typeable" : "unwrap"//decide whether the current node can be clicked, typed or if it should later be unwrapped (unwrap)
+
+	let newNode = document.createElement(name);//create a node copy to add the content of the original to
+
+	//Normal childNodes:
+	for (let node of element.childNodes) {//add all children of the original node but also annotate them
+		newNode.appendChild(annotateNode(node))
+	}
+
+	//childNodes inside an iFrame:
+	if(element.nodeName=="IFRAME"){//if the original node is an iFrame add all its content too:
+			try{
+				let doc = element.contentDocument.body || element.contentWindow.document.body//find the iframes body as a root to start from
+				let nodes = doc.querySelectorAll(":scope > *")//select all direct children of the root element
+				for (let node of nodes){//annotate and add the nodes to the node copy
+					newNode.appendChild(annotateNode(node))
+				}
+			}catch(e){
+				console.log("Couldn't unwrap iFrame. Likely due to a cross-origin request issue: ",e)
+			}
+	}
+
+	//childNodes inside shadowDOM:
+	if (element.shadowRoot) {//if the lement is a shadow dom element add its children too
+		for (let node of element.shadowRoot.childNodes) {//annotate and add children of shadow dom root
+			newNode.appendChild(annotateNode(node))
+		}
+	}
+
+	//add text to empty elements based on their attributes
+	if(newNode.innerText.trim().replaceAll(" ","") == ""){
+		newNode.innerText = "";
+		let replacer = element.title || element.ariaLabel || element.placeholder || element.alt;
+		if(replacer){
+			newNode.appendChild(document.createTextNode(replacer))
+		}
+	}
+
+	return newNode
+}
+function cleanUp(res){//clean up an annotated html
+  res = res.replaceAll("<unwrap>","<br>").replaceAll("</unwrap>","<br>")//remove all unwrap tags (not their content)
+  res = res.replaceAll(/<br>/g, '\\n');//replace <br> tags with \\n
+  res = res.replaceAll(' ', ' ');//replace   with blanks
+  res = res.replaceAll(/<clickable>\s*<\/clickable>/g, '');//remove empty clickable tags
+  res = res.replaceAll(/<typeable>\s*<\/typeable>/g, '');//remove empty typeable tags
+  res = res.replaceAll(/\\n\s+/g, '\\n');//replace multiple \\n with just one \\n
+  res = res.replaceAll(/ {2,}/g, ' ')//replace more than two blanks with just one blank
+  return res
+}
+function getAllHTML() {//function to retrieve the current page as annotated text
+  try{
+      return cleanUp(annotateNode(document.body).outerHTML)
+  }catch{
+     return cleanUp(annotateNode(document.body))
+  }
+}
+return getAllHTML();
+}"""
+
+is_clickable = ':is(a, button, select, option, area, input, [role], [onclick])'  # fast css query to find clickable elements
+is_typeable = ':is(input,textarea,[role], [onkeydown],[onkeypress],[onkeyup])'  # fast css query to find elements one can type in
+p = sync_playwright().start()
+firefox = p.firefox#get firefox instance. Note: You may have to install firefox with "playwright install firefox"
+browser = firefox.launch()#Open firefox. To view the browser window pass headless=False to the launch function
+page = browser.new_page()#Creates a new page instance
+
+def text_selector(text):#Creates a css selector that searches for elements with the specified text contained in descriptive attributes
+    text = repr(text)
+    return ':is([aria-label = '+text+' i],[title = '+text+' i],[alt = '+text+' i], [placeholder = '+text+' i], [value = '+text+' i])'
+def open_page(url):#Opens an url
+    page.goto(url=url)
+
+def get_info():#Executes the JavaScript website parser to get an annotated representation of the website
+    expect(page.locator("css=body")).to_be_visible()#Wait for body to be visible (=Wait for page to finish loading)
+    res = page.evaluate(parse_script)#Execute js parser
+    return res
+def click(text):
+	try:
+		elements = page.get_by_text(text).or_(page.locator("css={}".format(text_selector(text))))#Select all elements that contain the text
+		button = elements.and_(page.locator("css={}".format(is_clickable))).first#Of the elements that contain the text, select the first that is clickable
+		button.click(force=True)#Click the clickable element
+	except Exception as e:
+		print("Clicking '{}' failed!".format(text))
+		print(e)
+
+def type(text,to_type,press_enter=True):
+	try:
+		elements = page.get_by_text(text).or_(page.locator("css={}".format(text_selector(text))))#Find all elements that contain the text
+		field = elements.and_(page.locator("css={}".format(is_typeable))).first#Of the elements that contain the text select the first one that is an text input field
+		field.type(to_type)#Type into the text input field
+		if press_enter:#Press enter if necessary:
+			page.keyboard.press("Enter")
+	except Exception as e:
+		print("Typing into '{}' failed!".format(text))
+		print(e)
+
+open_page("https://www.example.com")
+print(get_info())
+click("More information")
+print(get_info())
